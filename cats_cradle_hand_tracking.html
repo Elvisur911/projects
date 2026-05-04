@@ -1,0 +1,316 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cat's Cradle Hand Tracking</title>
+  <style>body{margin:0;background:#05071a;color:#00ffcc;font-family:monospace;} .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;}</style>
+</head>
+<body>
+
+<h2 class="sr-only">Interactive cat's cradle string animation using webcam hand tracking with glowing laser strings</h2>
+
+<div id="root" style="position:relative;width:100%;height:600px;background:#05071a;border-radius:12px;overflow:hidden;font-family:monospace;">
+
+  <div id="status" style="position:absolute;top:16px;left:0;right:0;text-align:center;z-index:20;pointer-events:none;">
+    <span id="status-text" style="color:#00ffcc;font-size:13px;letter-spacing:2px;text-shadow:0 0 8px #00ffcc88;">INITIALIZING...</span>
+  </div>
+
+  <canvas id="bg-canvas" style="position:absolute;inset:0;width:100%;height:100%;"></canvas>
+  <video id="video" autoplay muted playsinline style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0.18;transform:scaleX(-1);"></video>
+  <canvas id="main-canvas" style="position:absolute;inset:0;width:100%;height:100%;"></canvas>
+
+  <div id="no-support" style="display:none;position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;color:#00ffcc;font-size:14px;letter-spacing:1px;text-align:center;padding:2rem;"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+
+<script>
+const W = () => document.getElementById('root').offsetWidth;
+const H = () => document.getElementById('root').offsetHeight;
+
+const FINGER_TIPS = [4,8,12,16,20];
+const COLORS = [
+  {r:0,g:255,b:204},
+  {r:255,g:0,b:204},
+  {r:255,g:204,b:0},
+  {r:0,g:180,b:255},
+  {r:180,g:0,b:255}
+];
+
+let hands = null, camera = null;
+let leftLandmarks = null, rightLandmarks = null;
+let particles = [];
+let p5inst = null;
+let frameW = 0, frameH = 0;
+
+function setStatus(msg, color) {
+  const el = document.getElementById('status-text');
+  el.textContent = msg;
+  el.style.color = color || '#00ffcc';
+  el.style.textShadow = `0 0 8px ${(color||'#00ffcc')}88`;
+}
+
+function lm2px(lm, w, h) {
+  return { x: (1 - lm.x) * w, y: lm.y * h };
+}
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+function drawCRTScanlines(ctx, w, h) {
+  ctx.save();
+  for (let y = 0; y < h; y += 4) {
+    ctx.fillStyle = 'rgba(0,0,0,0.12)';
+    ctx.fillRect(0, y, w, 1);
+  }
+  ctx.fillStyle = 'rgba(5,7,26,0.08)';
+  const grad = ctx.createRadialGradient(w/2,h/2,h*0.2,w/2,h/2,h*0.9);
+  grad.addColorStop(0,'rgba(0,0,0,0)');
+  grad.addColorStop(1,'rgba(0,0,0,0.5)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0,0,w,h);
+  ctx.restore();
+}
+
+function drawGlowLine(ctx, x1, y1, x2, y2, col, alpha, thickness, dist) {
+  const t = Math.max(0, Math.min(1, dist / 300));
+  const w = thickness * (1 + t * 2.5);
+  const a = alpha * (1 - t * 0.4);
+
+  ctx.save();
+  ctx.shadowColor = `rgba(${col.r},${col.g},${col.b},${a * 0.9})`;
+  ctx.shadowBlur = 18 + t * 20;
+
+  const grad = ctx.createLinearGradient(x1,y1,x2,y2);
+  grad.addColorStop(0,  `rgba(${col.r},${col.g},${col.b},${a})`);
+  grad.addColorStop(0.5,`rgba(255,255,255,${a * 0.85})`);
+  grad.addColorStop(1,  `rgba(${col.r},${col.g},${col.b},${a})`);
+
+  ctx.strokeStyle = grad;
+  ctx.lineWidth = w;
+  ctx.lineCap = 'round';
+  ctx.globalAlpha = 1;
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2, y2);
+  ctx.stroke();
+
+  ctx.shadowBlur = 6;
+  ctx.strokeStyle = `rgba(255,255,255,${a * 0.6})`;
+  ctx.lineWidth = Math.max(0.5, w * 0.3);
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x2, y2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawLandmarkDot(ctx, x, y, col, pulse) {
+  ctx.save();
+  ctx.shadowColor = `rgba(${col.r},${col.g},${col.b},0.9)`;
+  ctx.shadowBlur = 12 + pulse * 8;
+  ctx.fillStyle = `rgba(${col.r},${col.g},${col.b},0.9)`;
+  ctx.beginPath();
+  ctx.arc(x, y, 4 + pulse * 2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.beginPath();
+  ctx.arc(x, y, 2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function spawnParticles(x, y, col) {
+  for (let i = 0; i < 18; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 1 + Math.random() * 4;
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 1.0,
+      decay: 0.025 + Math.random() * 0.04,
+      size: 1.5 + Math.random() * 3,
+      col
+    });
+  }
+}
+
+function updateParticles(ctx) {
+  particles = particles.filter(p => p.life > 0);
+  for (const p of particles) {
+    ctx.save();
+    ctx.globalAlpha = p.life;
+    ctx.shadowColor = `rgba(${p.col.r},${p.col.g},${p.col.b},${p.life})`;
+    ctx.shadowBlur = 8;
+    ctx.fillStyle = `rgba(${p.col.r},${p.col.g},${p.col.b},${p.life})`;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    p.x += p.vx; p.y += p.vy;
+    p.vy += 0.05;
+    p.life -= p.decay;
+  }
+}
+
+let touchDistPrev = {};
+
+function dist2d(a, b) {
+  return Math.sqrt((a.x-b.x)**2 + (a.y-b.y)**2);
+}
+
+function renderFrame() {
+  const canvas = document.getElementById('main-canvas');
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  const now = Date.now() / 1000;
+
+  ctx.clearRect(0, 0, w, h);
+
+  const lTips = [], rTips = [];
+
+  if (leftLandmarks) {
+    for (let i = 0; i < FINGER_TIPS.length; i++) {
+      const lm = leftLandmarks[FINGER_TIPS[i]];
+      lTips.push(lm2px(lm, w, h));
+    }
+  }
+  if (rightLandmarks) {
+    for (let i = 0; i < FINGER_TIPS.length; i++) {
+      const lm = rightLandmarks[FINGER_TIPS[i]];
+      rTips.push(lm2px(lm, w, h));
+    }
+  }
+
+  const pulse = (Math.sin(now * 3) + 1) / 2;
+
+  if (lTips.length > 0 && rTips.length > 0) {
+    for (let i = 0; i < lTips.length; i++) {
+      for (let j = 0; j < rTips.length; j++) {
+        const col = COLORS[(i + j) % COLORS.length];
+        const dx = rTips[j].x - lTips[i].x;
+        const dy = rTips[j].y - lTips[i].y;
+        const d = Math.sqrt(dx*dx + dy*dy);
+        drawGlowLine(ctx, lTips[i].x, lTips[i].y, rTips[j].x, rTips[j].y, col, 0.72 + pulse*0.15, 1.5, d);
+
+        const key = `${i}_${j}`;
+        if (touchDistPrev[key] !== undefined && touchDistPrev[key] > 30 && d < 30) {
+          spawnParticles((lTips[i].x + rTips[j].x)/2, (lTips[i].y + rTips[j].y)/2, col);
+        }
+        touchDistPrev[key] = d;
+      }
+    }
+  }
+
+  if (lTips.length > 1) {
+    for (let i = 0; i < lTips.length - 1; i++) {
+      const col = COLORS[i % COLORS.length];
+      const d = dist2d(lTips[i], lTips[i+1]);
+      drawGlowLine(ctx, lTips[i].x, lTips[i].y, lTips[i+1].x, lTips[i+1].y, col, 0.45, 1.2, d);
+    }
+  }
+  if (rTips.length > 1) {
+    for (let i = 0; i < rTips.length - 1; i++) {
+      const col = COLORS[i % COLORS.length];
+      const d = dist2d(rTips[i], rTips[i+1]);
+      drawGlowLine(ctx, rTips[i].x, rTips[i].y, rTips[i+1].x, rTips[i+1].y, col, 0.45, 1.2, d);
+    }
+  }
+
+  for (let i = 0; i < lTips.length; i++) drawLandmarkDot(ctx, lTips[i].x, lTips[i].y, COLORS[i % COLORS.length], pulse);
+  for (let i = 0; i < rTips.length; i++) drawLandmarkDot(ctx, rTips[i].x, rTips[i].y, COLORS[i % COLORS.length], pulse);
+
+  updateParticles(ctx);
+  drawCRTScanlines(ctx, w, h);
+  requestAnimationFrame(renderFrame);
+}
+
+function resizeCanvases() {
+  const root = document.getElementById('root');
+  const w = root.offsetWidth, h = root.offsetHeight;
+  ['bg-canvas','main-canvas'].forEach(id => {
+    const c = document.getElementById(id);
+    c.width = w; c.height = h;
+  });
+  frameW = w; frameH = h;
+
+  const bg = document.getElementById('bg-canvas').getContext('2d');
+  bg.fillStyle = '#05071a';
+  bg.fillRect(0,0,w,h);
+  for (let i = 0; i < 60; i++) {
+    const x = Math.random()*w, y = Math.random()*h;
+    const r = Math.random()*1.5;
+    bg.beginPath();
+    bg.arc(x,y,r,0,Math.PI*2);
+    bg.fillStyle = `rgba(${Math.random()>0.5?0:100},${180+Math.random()*75},${200+Math.random()*55},${0.3+Math.random()*0.5})`;
+    bg.fill();
+  }
+}
+
+async function init() {
+  resizeCanvases();
+  window.addEventListener('resize', resizeCanvases);
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus('CAMERA NOT SUPPORTED', '#ff4444');
+    return;
+  }
+
+  setStatus('REQUESTING CAMERA ACCESS...', '#ffcc00');
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:640,height:480}});
+    const video = document.getElementById('video');
+    video.srcObject = stream;
+    await video.play();
+    setStatus('LOADING HAND TRACKING...', '#ffcc00');
+  } catch(e) {
+    setStatus('CAMERA DENIED — allow camera access and reload', '#ff4444');
+    return;
+  }
+
+  try {
+    hands = new Hands({locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${f}`});
+    hands.setOptions({maxNumHands:2, modelComplexity:1, minDetectionConfidence:0.7, minTrackingConfidence:0.6});
+    hands.onResults(results => {
+      leftLandmarks = null; rightLandmarks = null;
+      if (results.multiHandLandmarks) {
+        results.multiHandLandmarks.forEach((lms, idx) => {
+          const label = results.multiHandedness[idx]?.label;
+          if (label === 'Left') leftLandmarks = lms;
+          else rightLandmarks = lms;
+        });
+      }
+      const both = leftLandmarks && rightLandmarks;
+      const one = leftLandmarks || rightLandmarks;
+      setStatus(
+        both ? 'BOTH HANDS DETECTED — CAT\'S CRADLE ACTIVE' :
+        one  ? 'ONE HAND DETECTED — SHOW SECOND HAND' :
+               'SHOW HANDS TO CAMERA',
+        both ? '#00ffcc' : one ? '#ffcc00' : '#888'
+      );
+    });
+
+    const video = document.getElementById('video');
+    camera = new Camera(video, {
+      onFrame: async () => { await hands.send({image: video}); },
+      width: 640, height: 480
+    });
+    await camera.start();
+    setStatus('SHOW HANDS TO CAMERA', '#aaa');
+    requestAnimationFrame(renderFrame);
+  } catch(e) {
+    setStatus('MEDIAPIPE LOAD ERROR — ' + e.message, '#ff4444');
+    requestAnimationFrame(renderFrame);
+  }
+}
+
+window.addEventListener('load', init);
+</script>
+
+</body>
+</html>
